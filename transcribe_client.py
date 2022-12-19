@@ -1,11 +1,14 @@
 #! python3.7
+"""Microphone agent. Delegate heavy lifting to server, and do all the mic stuff"""
 
 import argparse
 import datetime
+import io
 import os
 import queue
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from time import sleep
 
 import speech_recognition as sr
@@ -25,6 +28,7 @@ def main():
     parser.add_argument("--phrase_timeout", default=3,
                         help="How much empty space between recordings before we "
                              "consider it a new line in the transcription.", type=float)
+    parser.add_argument("--logdir", type=Path, help="log directory to save", default='log')
     args = parser.parse_args()
 
     # The last time a recording was retreived from the queue.
@@ -67,7 +71,7 @@ def main():
     print("Ready.\n")
 
     keepalive = KeepAlive(1)
-    cnx = connection_coroutine()
+    cnx = connection_coroutine(args.host, args.port)
     cnx.send(None)
     while True:
         try:
@@ -75,7 +79,8 @@ def main():
             if data_queue.empty():
                 sleep(0.25)
                 if keepalive.step():
-                    print(".", end="")
+                    # print(".", end="")
+                    # sys.stdout.flush()
                     cnx.send(b'')
                 continue
 
@@ -83,6 +88,15 @@ def main():
             now = datetime.utcnow()
             phrase_complete = False
             if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
+                # Save before reset, if specified
+                if args.logdir is not None:
+                    args.logdir.mkdir(exist_ok=True, parents=True)
+                    audio_data = sr.AudioData(data, 16000, 2)
+                    wav_data = io.BytesIO(audio_data.get_wav_data())
+                    with (args.logdir / f"{now.isoformat()}.wav").open('w+b') as f:
+                        f.write(wav_data.read())
+
+                # Reset
                 current_sample = bytes()
                 phrase_complete = True
             phrase_time = now
@@ -108,7 +122,7 @@ def main():
 
             # Clear the console to reprint the updated transcription.
             os.system('cls' if os.name=='nt' else 'clear')
-            for line in transcription:
+            for line in transcription[-100:]:
                 print(line)
             # Flush stdout.
             print('', end='', flush=True)
@@ -151,23 +165,25 @@ def recv_exact(n, conn):
 
 
 @contextmanager
-def connect(host: str, port: int):
+def connect(host: str, port: int, timeout_seconds: int = 60):
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
+                s.settimeout(timeout_seconds)
                 s.connect((host, port))
                 yield s
-                s.close()
-                break
             except ConnectionRefusedError:
-                print("Server is not available. Retry in 5 seconds.")
+                print(f"Server is not available ({host}:{port}). Retry in 5 seconds.")
                 sleep(5)
+                continue
+            s.close()
+            break
+
     return
 
 
-def connection_coroutine():
-    with connect() as s:
-        s.settimeout(5)
+def connection_coroutine(host: str, port: int):
+    with connect(host, port) as s:
         text = None
 
         while True:
